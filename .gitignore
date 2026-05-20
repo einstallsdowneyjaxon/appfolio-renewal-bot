@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.local
+.playwright-appfolio-profile/
+.appfolio-google-token.json
+client_secret.json
+*.png

@@ -1,0 +1,122 @@
+# AppFolio Lease Renewal Offer Automation
+
+This automation reads a specific row from `Lease_renewals_owner` / `Coco_XR`, logs into AppFolio with environment variables, prepares the renewal offer, and stops after configuring the renewal preview. It does not submit or send the renewal letter.
+
+## Required environment variables
+
+```powershell
+$env:APPFOLIO_USERNAME="your-appfolio-username"
+$env:APPFOLIO_PASSWORD="your-appfolio-password"
+```
+
+Optional AppFolio override:
+
+```powershell
+$env:APPFOLIO_URL="https://thetgpm.appfolio.com"
+```
+
+## Google Sheet authentication
+
+This bot uses a local Google OAuth client. On the first run it opens a browser so you can approve Google Sheets access. It saves the refresh token locally at `.appfolio-google-token.json`, so future runs do not require another Google login.
+
+```powershell
+$env:GOOGLE_OAUTH_CLIENT_JSON="C:\Users\Inqui\Downloads\client_secret_172984887894-fao8ei9m253ll9eoi4i3k45q4i54m9s4.apps.googleusercontent.com.json"
+```
+
+Optional token cache override:
+
+```powershell
+$env:GOOGLE_OAUTH_TOKEN_PATH=".appfolio-google-token.json"
+```
+
+The Google account you approve must have read access to the source spreadsheet. If lookup by spreadsheet name is ambiguous or unavailable, set:
+
+```powershell
+$env:LEASE_RENEWAL_SPREADSHEET_ID="spreadsheet-id"
+```
+
+For this sheet:
+
+```powershell
+$env:LEASE_RENEWAL_SPREADSHEET_ID="1dJBcNkXn2fVwgK1kETR5Sp4QuwyAIyhwjyAQ9BL5MBM"
+```
+
+## Run
+
+```powershell
+npm run appfolio:renewal
+```
+
+## Row selection for n8n/server runs
+
+The bot no longer defaults to row 2. A row must be provided by n8n payload or an environment variable.
+
+Supported n8n payload environment variables:
+
+```powershell
+$env:N8N_PAYLOAD='{"rowNumber":2}'
+$env:N8N_INPUT='{"row":2}'
+$env:N8N_JSON='{"sheetRow":2}'
+$env:LEASE_RENEWAL_PAYLOAD='{"leaseRenewalRow":2}'
+```
+
+Supported payload keys:
+
+- `rowNumber`
+- `row`
+- `sheetRow`
+- `leaseRenewalRow`
+- `row_number`
+- `sheet_row`
+- `lease_renewal_row`
+
+Fallback environment variable:
+
+```powershell
+$env:LEASE_RENEWAL_ROW="2"
+```
+
+The bot checks the row color before opening AppFolio. If any cell in the row is green, it logs `SKIPPED` and exits successfully without launching Playwright.
+
+## Addenda
+
+The bot always includes the standard renewal addenda list. The Sheet override columns are only for one-off cases:
+
+- Leave blank to use the standard addenda list.
+- Put addenda to add in `Addendums Added`.
+- Put addenda to remove in `Addendums Removed`.
+
+Multiple addenda can be separated by commas, semicolons, or new lines.
+
+The Month To Month section is also configured automatically:
+
+- Clears any pre-existing Month To Month addenda.
+- Adds `Month to Month Unavailable`.
+- Sets Month To Month `New Rent` to `Renewal Rate * 1.12`.
+
+Before reviewing, the bot checks `Renew by Default` and selects `Option 2` in `Default Option`.
+
+After the renewal letter prompt, the bot selects the `Renewal Letter Option` from the Sheet:
+
+- `Main` selects `Renewal Notice Letter`.
+- `Copy` selects `Copy of Renewal Notice Letter`.
+
+It then opens the lease preview, checks the required boxes in the lead paint, electronic notices, lawn maintenance, and pest control addenda, closes the browser without clicking `Cancel All`, and colors the processed Sheet row green.
+
+## Exit/log states
+
+The command logs one of these final states:
+
+- `SUCCESS` - row processed and marked green.
+- `SKIPPED` - row was already green/completed, or AppFolio showed the renewal was already sent/completed.
+- `ERROR` - failed safely; screenshot is saved if a browser page was open.
+
+Useful optional settings:
+
+```powershell
+$env:LEASE_RENEWAL_ROW="2"
+$env:LEASE_RENEWAL_TAB="Coco_XR"
+$env:HEADLESS="false"
+$env:PLAYWRIGHT_SLOW_MO="100"
+$env:USE_HARDCODED_TEST_ROW="false"
+```
