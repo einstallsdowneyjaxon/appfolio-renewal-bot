@@ -29,6 +29,10 @@ const CONFIG = {
   appfolioNoticeUrl: process.env.APPFOLIO_NOTICE_URL || "",
   headless: parseBoolean(process.env.HEADLESS, false),
   slowMo: Number(process.env.PLAYWRIGHT_SLOW_MO || "0"),
+  appfolioMfaCode: process.env.APPFOLIO_MFA_CODE || "",
+  appfolioLoginTimeoutMs: Number(process.env.APPFOLIO_LOGIN_TIMEOUT_MS || "60000"),
+  appfolioActionTimeoutMs: Number(process.env.APPFOLIO_ACTION_TIMEOUT_MS || "30000"),
+  diagnosticMode: parseBoolean(process.env.APPFOLIO_DIAGNOSTIC_MODE, true),
 };
 
 class SkipError extends Error {
@@ -84,6 +88,69 @@ function logState(state, detail = "") {
 
 function fail(message) {
   throw new Error(message);
+}
+
+function diagnosticLabel(value) {
+  return String(value || "diagnostic").replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
+}
+
+async function capturePageDiagnostics(page, label, detail = "") {
+  if (!page || page.isClosed?.()) return "";
+  const safeLabel = diagnosticLabel(label);
+  const screenshotPath = path.resolve(process.cwd(), `appfolio-${safeLabel}-${Date.now()}.png`);
+  const url = page.url();
+  const title = await page.title().catch(() => "");
+  const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+  const summary = await page.evaluate(() => {
+    function clean(value) {
+      return String(value || "").replace(/\s+/g, " ").trim();
+    }
+
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    }
+
+    const inputs = Array.from(document.querySelectorAll("input, textarea, [contenteditable='true'], [role='searchbox'], [role='combobox']"))
+      .filter(isVisible)
+      .slice(0, 12)
+      .map((element) => ({
+        tag: element.tagName,
+        type: element.getAttribute("type") || "",
+        role: element.getAttribute("role") || "",
+        name: element.getAttribute("name") || "",
+        placeholder: element.getAttribute("placeholder") || "",
+        aria: element.getAttribute("aria-label") || "",
+        text: clean(element.textContent).slice(0, 80),
+      }));
+
+    const links = Array.from(document.querySelectorAll("a, button"))
+      .filter(isVisible)
+      .slice(0, 20)
+      .map((element) => clean(element.textContent || element.getAttribute("aria-label")).slice(0, 80))
+      .filter(Boolean);
+
+    return { inputs, links };
+  }).catch(() => ({ inputs: [], links: [] }));
+
+  if (CONFIG.diagnosticMode) {
+    await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+  }
+
+  log("DIAGNOSTIC", `${label}${detail ? ` - ${detail}` : ""}`);
+  log("DIAGNOSTIC_URL", url);
+  log("DIAGNOSTIC_TITLE", title || "(no title)");
+  log("DIAGNOSTIC_BODY", bodyText.slice(0, 700).replace(/\s+/g, " "));
+  log("DIAGNOSTIC_INPUTS", JSON.stringify(summary.inputs));
+  log("DIAGNOSTIC_ACTIONS", JSON.stringify(summary.links));
+  if (CONFIG.diagnosticMode) log("DIAGNOSTIC_SCREENSHOT", screenshotPath);
+  return screenshotPath;
+}
+
+async function failWithDiagnostics(page, message, label = "failure") {
+  await capturePageDiagnostics(page, label, message);
+  fail(message);
 }
 
 function requireEnv(name) {
@@ -764,109 +831,332 @@ async function selectByLabel(page, labels, optionText) {
 }
 
 async function login(page, username, password) {
-  log("Opening AppFolio", CONFIG.appfolioUrl);
-  await page.goto(CONFIG.appfolioUrl, { waitUntil: "domcontentloaded" });
-  await page.waitForLoadState("networkidle").catch(() => {});
+  const loginStartedAt = Date.now();
+  log("LOGIN_STEP", `Opening AppFolio ${CONFIG.appfolioUrl}`);
+  await page.goto(CONFIG.appfolioUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.appfolioLoginTimeoutMs });
+  log("LOGIN_STEP", `AppFolio page opened at ${page.url()}`);
 
   if (await isSignedIn(page)) {
-    log("AppFolio session already signed in");
+    await findSearchBox(page, CONFIG.appfolioActionTimeoutMs, "session reuse");
+    logState("SESSION_REUSED", "Existing AppFolio authenticated browser session is valid");
     return;
   }
 
-  log("Logging into AppFolio");
+  logState("LOGIN_REQUIRED", "Existing AppFolio session is missing or expired");
+  log("LOGIN_STEP", "Waiting for login form");
+  await waitForLoginForm(page, loginStartedAt);
+  log("LOGIN_STEP", "Login form detected");
+
+  log("LOGIN_STEP", "Filling username");
   await fillByLabel(page, ["email", "username", "login"], username);
+  log("LOGIN_STEP", "Username filled");
+
+  log("LOGIN_STEP", "Filling password");
   await fillByLabel(page, ["password"], password);
+  log("LOGIN_STEP", "Password filled");
+
+  log("LOGIN_STEP", "Clicking login button");
   await clickByRoleOrText(page, "sign in|log in|login", "login button");
-  await page.waitForLoadState("domcontentloaded");
-  await page.waitForLoadState("networkidle").catch(() => {});
+  log("LOGIN_STEP", "Login button clicked; waiting for signed-in UI or MFA prompt");
 
-  const bodyText = await page.locator("body").innerText().catch(() => "");
-  if (/2-Step Verification|Send Verification Code|verification code/i.test(bodyText)) {
-    log("AppFolio requires 2-step verification", "Requesting verification code");
-    await clickByRoleOrText(page, "send verification code", "Send Verification Code button");
-    await page.waitForLoadState("networkidle").catch(() => {});
+  const firstOutcome = await waitForLoginOutcome(page, loginStartedAt);
+  log("LOGIN_STEP", `Login outcome detected: ${firstOutcome}`);
 
-    const verificationCode = await askForInput("Enter AppFolio verification code: ");
-    if (!verificationCode) fail("No AppFolio verification code was entered");
+  if (firstOutcome === "mfa") {
+    logState("MFA_REQUIRED", "AppFolio requested 2-step verification");
+    const sendCodeButton = await page.getByRole("button", { name: /send verification code/i }).first()
+      .isVisible()
+      .catch(() => false);
+    if (sendCodeButton) {
+      log("LOGIN_STEP", "Clicking Send Verification Code");
+      await clickByRoleOrText(page, "send verification code", "Send Verification Code button");
+      log("LOGIN_STEP", "Send Verification Code clicked");
+    }
 
-    const afterPromptText = await page.locator("body").innerText().catch(() => "");
-    if (!/2-Step Verification|verification code/i.test(afterPromptText)) {
-      log("2-step verification completed manually");
+    const verificationCode = CONFIG.appfolioMfaCode;
+    if (!verificationCode) {
+      fail("MFA_REQUIRED: AppFolio requested verification. Reuse an authenticated PLAYWRIGHT_USER_DATA_DIR session or provide APPFOLIO_MFA_CODE for this run.");
+    }
+
+    if (await isSignedIn(page)) {
+      logState("LOGIN_SUCCESS", "AppFolio authenticated after MFA send step");
       return;
     }
 
-    log("Entering AppFolio verification code");
+    log("LOGIN_STEP", "Entering AppFolio verification code");
     await fillByLabel(page, ["Verification Code", "Code", "Security Code"], verificationCode);
+    log("LOGIN_STEP", "Verification code filled");
+    log("LOGIN_STEP", "Clicking MFA submit button");
     await clickByRoleOrText(page, "verify|submit|continue|sign in|log in", "2-step verification submit button");
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
-    await page.waitForLoadState("networkidle").catch(() => {});
-    log("2-step verification completed");
+    log("LOGIN_STEP", "MFA submit clicked; waiting for signed-in UI");
+    const mfaOutcome = await waitForLoginOutcome(page, loginStartedAt);
+    log("LOGIN_STEP", `Post-MFA outcome detected: ${mfaOutcome}`);
   }
+
+  if (!await isSignedIn(page)) {
+    await saveLoginHangScreenshot(page, "login-not-complete");
+    fail(`AppFolio login did not complete within ${CONFIG.appfolioLoginTimeoutMs}ms`);
+  }
+  await findSearchBox(page, CONFIG.appfolioActionTimeoutMs, "after AppFolio login");
+  logState("LOGIN_SUCCESS", "AppFolio authenticated session saved in persistent browser profile");
+}
+
+async function waitForLoginForm(page, startedAt) {
+  while (Date.now() - startedAt < CONFIG.appfolioLoginTimeoutMs) {
+    if (await isSignedIn(page)) return;
+    const emailField = await page.getByLabel(/email|username|login/i).first().isVisible().catch(() => false);
+    const passwordField = await page.getByLabel(/password/i).first().isVisible().catch(() => false);
+    const emailInput = await page.locator("input[type='email'], input[name*='email' i], input[name*='username' i], input[name*='login' i]").first()
+      .isVisible()
+      .catch(() => false);
+    const passwordInput = await page.locator("input[type='password'], input[name*='password' i]").first()
+      .isVisible()
+      .catch(() => false);
+    if ((emailField || emailInput) && (passwordField || passwordInput)) return;
+    await page.waitForTimeout(500);
+  }
+  await saveLoginHangScreenshot(page, "login-form-timeout");
+  fail(`AppFolio login form did not appear within ${CONFIG.appfolioLoginTimeoutMs}ms`);
+}
+
+async function waitForLoginOutcome(page, startedAt) {
+  while (Date.now() - startedAt < CONFIG.appfolioLoginTimeoutMs) {
+    if (await isSignedIn(page)) return "signed-in";
+    const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+    if (/2-Step Verification|Send Verification Code|verification code|multi-factor|mfa/i.test(bodyText)) return "mfa";
+    if (/invalid|incorrect|could not log|try again|account locked/i.test(bodyText)) {
+      await saveLoginHangScreenshot(page, "login-error");
+      fail(`AppFolio login page reported an error. Page text starts with: ${bodyText.slice(0, 300)}`);
+    }
+    await page.waitForTimeout(750);
+  }
+
+  await saveLoginHangScreenshot(page, "login-outcome-timeout");
+  fail(`AppFolio login did not complete within ${CONFIG.appfolioLoginTimeoutMs}ms`);
+}
+
+async function saveLoginHangScreenshot(page, label) {
+  const safeLabel = String(label).replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
+  const screenshotPath = path.resolve(process.cwd(), `appfolio-login-${safeLabel}-${Date.now()}.png`);
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+  log("LOGIN_SCREENSHOT", screenshotPath);
 }
 
 async function isSignedIn(page) {
-  const searchBox = await findSearchBox(page, 2000).catch(() => null);
-  if (searchBox) return true;
+  if (await hasSearchBox(page, 1000)) return true;
   const bodyText = await page.locator("body").innerText().catch(() => "");
   return /Dashboard|Property Manager|Tasks/i.test(bodyText) && /Search AppFolio/i.test(bodyText);
 }
 
 async function searchTenant(page, tenantName) {
   log("Searching tenant", tenantName);
-  const searchBox = await findSearchBox(page, 5000);
+  const searchBox = await findSearchBox(page, CONFIG.appfolioActionTimeoutMs, "tenant search");
 
-  await searchBox.fill(tenantName);
-  await page.keyboard.press("Enter");
-  await page.waitForLoadState("domcontentloaded").catch(() => {});
-  await page.waitForLoadState("networkidle").catch(() => {});
+  log("SEARCH_STEP", "Filling global search box");
+  await replaceInputValue(searchBox, tenantName);
+  log("SEARCH_STEP", "Submitting global search");
+  await searchBox.press("Enter").catch(async () => {
+    await page.keyboard.press("Enter");
+  });
+  await waitForTenantSearchResponse(page, tenantName);
+
+  if (await isTenantPage(page, tenantName)) {
+    log("Tenant page opened from search", `${tenantName} at ${page.url()}`);
+    return;
+  }
 
   log("Opening tenant page", tenantName);
-  const tenantLink = page.getByRole("link", { name: new RegExp(escapeRegex(tenantName), "i") });
-  const result = await visibleFirst(tenantLink, `tenant result for ${tenantName}`, 10000).catch(() => null);
-  if (result) {
-    await result.click();
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
-    await page.waitForLoadState("networkidle").catch(() => {});
+  await openTenantSearchResult(page, tenantName);
+  if (await isTenantPage(page, tenantName)) {
+    log("Tenant page opened", `${tenantName} at ${page.url()}`);
     return;
   }
 
-  if (new RegExp(escapeRegex(tenantName), "i").test(await page.locator("body").innerText())) {
-    return;
-  }
-
-  fail(`Could not open tenant page for: ${tenantName}`);
+  const bodyPreview = (await page.locator("body").innerText().catch(() => "")).slice(0, 500);
+  await failWithDiagnostics(page, `Clicked search result but did not reach tenant page for "${tenantName}". URL: ${page.url()}. Page starts with: ${bodyPreview}`, "tenant-page-not-opened");
 }
 
-async function findSearchBox(page, timeout = 2000) {
+async function waitForTenantSearchResponse(page, tenantName) {
+  const deadline = Date.now() + CONFIG.appfolioActionTimeoutMs;
+  const tenantRegex = new RegExp(escapeRegex(tenantName), "i");
+  while (Date.now() < deadline) {
+    if (await isTenantPage(page, tenantName)) return;
+    const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+    if (tenantRegex.test(bodyText)) {
+      log("SEARCH_STEP", "Search results contain tenant name");
+      return;
+    }
+    if (/No results|No matches|No records/i.test(bodyText)) {
+      await failWithDiagnostics(page, `AppFolio search returned no results for "${tenantName}"`, "tenant-search-no-results");
+    }
+    await page.waitForTimeout(500);
+  }
+  await failWithDiagnostics(page, `Timed out waiting for AppFolio search results for "${tenantName}"`, "tenant-search-timeout");
+}
+
+async function openTenantSearchResult(page, tenantName) {
+  const tenantRegex = new RegExp(escapeRegex(tenantName), "i");
+  await page.waitForFunction((name) => document.body.innerText.toLowerCase().includes(name.toLowerCase()), tenantName, { timeout: 10000 })
+    .catch(() => {});
+
+  const locators = [
+    page.getByRole("link", { name: tenantRegex }),
+    page.locator("a").filter({ hasText: tenantRegex }),
+    page.locator("tr, li, .search-result, .search-results, .list-group-item, .row, [class*='result']")
+      .filter({ hasText: tenantRegex })
+      .locator("a")
+      .first(),
+  ];
+
+  for (const locator of locators) {
+    const result = await visibleFirst(locator, `tenant search result for ${tenantName}`, 3000).catch(() => null);
+    if (!result) continue;
+    await result.scrollIntoViewIfNeeded().catch(() => {});
+    const previousUrl = page.url();
+    log("SEARCH_STEP", `Clicking tenant search result from ${previousUrl}`);
+    await result.click({ force: true });
+    await waitForTenantPageAfterClick(page, tenantName, previousUrl);
+    return;
+  }
+
+  const href = await findTenantResultHref(page, tenantName);
+  if (href) {
+    log("Opening tenant result href", href);
+    await page.goto(href, { waitUntil: "domcontentloaded" });
+    await waitForTenantPageAfterClick(page, tenantName, "");
+    return;
+  }
+
+  const bodyPreview = (await page.locator("body").innerText().catch(() => "")).slice(0, 500);
+  await failWithDiagnostics(page, `Could not find clickable tenant search result for "${tenantName}". URL: ${page.url()}. Page starts with: ${bodyPreview}`, "tenant-result-not-found");
+}
+
+async function waitForTenantPageAfterClick(page, tenantName, previousUrl) {
+  const deadline = Date.now() + CONFIG.appfolioActionTimeoutMs;
+  while (Date.now() < deadline) {
+    if (await isTenantPage(page, tenantName)) return;
+    if (previousUrl && page.url() !== previousUrl) {
+      log("SEARCH_STEP", `Tenant result navigation URL changed to ${page.url()}`);
+    }
+    await page.waitForTimeout(500);
+  }
+  await failWithDiagnostics(page, `Timed out after clicking tenant search result for "${tenantName}"`, "tenant-click-timeout");
+}
+
+async function findTenantResultHref(page, tenantName) {
+  const href = await page.evaluate((name) => {
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    }
+
+    function normalize(value) {
+      return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    }
+
+    const target = normalize(name);
+    const anchors = Array.from(document.querySelectorAll("a[href]"))
+      .filter((anchor) => isVisible(anchor) && normalize(anchor.textContent).includes(target))
+      .map((anchor) => ({
+        href: anchor.href,
+        text: normalize(anchor.textContent),
+      }))
+      .filter(({ href }) => href && !href.endsWith("#") && !href.startsWith("javascript:"));
+
+    const preferred = anchors.find(({ href }) => /tenant|occupanc|people|lease/i.test(href));
+    return (preferred || anchors[0])?.href || "";
+  }, tenantName);
+
+  return href || "";
+}
+
+async function isTenantPage(page, tenantName) {
+  const bodyText = await page.locator("body").innerText().catch(() => "");
+  const hasTenantName = new RegExp(escapeRegex(tenantName), "i").test(bodyText);
+  const hasTenantPageSignals = /Eligible for Renewal|Primary Tenant|Tenant Status|Recurring Charges|Portal Active|Move Out|Delinquency Notes/i.test(bodyText);
+  const hasTaskSignals = /Prepare Renewal Offer|Prepare Renewal Letter|Review Renewal Offer|Send Renewal Offer|Send Renewal Letter/i.test(bodyText);
+  const urlLooksTenantish = /tenant|occupanc|lease/i.test(page.url());
+  return hasTenantName && (hasTenantPageSignals || hasTaskSignals || urlLooksTenantish);
+}
+
+async function hasSearchBox(page, timeout = 1000) {
+  return Boolean(await findSearchBox(page, timeout, "auth check", { diagnose: false }).catch(() => null));
+}
+
+async function findSearchBox(page, timeout = 2000, context = "global search", options = {}) {
+  const diagnose = options.diagnose !== false;
+  const deadline = Date.now() + timeout;
   const searchLocators = [
     page.getByRole("searchbox"),
     page.getByPlaceholder(/search appfolio|search/i),
     page.getByLabel(/search appfolio|search/i),
     page.locator("input[type='search']"),
+    page.locator("input[placeholder*='Search' i]"),
+    page.locator("input[aria-label*='Search' i]"),
     page.locator("input[name*='search' i]"),
+    page.locator("[contenteditable='true'][role='searchbox']"),
+    page.locator("[contenteditable='true'][aria-label*='Search' i]"),
   ];
 
-  for (const locator of searchLocators) {
-    const searchBox = await visibleFirst(locator, "global search box", timeout).catch(() => null);
-    if (searchBox) return searchBox;
+  while (Date.now() < deadline) {
+    for (const locator of searchLocators) {
+      const count = await locator.count().catch(() => 0);
+      for (let index = 0; index < Math.min(count, 5); index += 1) {
+        const candidate = locator.nth(index);
+        if (await candidate.isVisible().catch(() => false)) {
+          log("SEARCH_BOX_FOUND", `${context} via locator ${searchLocators.indexOf(locator)}.${index}`);
+          return candidate;
+        }
+      }
+    }
+
+    const domIndex = await page.evaluate(() => {
+      function isVisible(element) {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      }
+
+      const candidates = Array.from(document.querySelectorAll("input, textarea, [contenteditable='true'], [role='searchbox']"));
+      return candidates.findIndex((element) => {
+        const haystack = [
+          element.getAttribute("placeholder"),
+          element.getAttribute("aria-label"),
+          element.getAttribute("name"),
+          element.getAttribute("id"),
+          element.className,
+          element.getAttribute("role"),
+        ].join(" ").toLowerCase();
+        return isVisible(element) && /search|appfolio/.test(haystack);
+      });
+    }).catch(() => -1);
+    if (domIndex >= 0) {
+      log("SEARCH_BOX_FOUND", `${context} via DOM index ${domIndex}`);
+      return page.locator("input, textarea, [contenteditable='true'], [role='searchbox']").nth(domIndex);
+    }
+
+    await page.waitForTimeout(500);
   }
-  fail("Could not find AppFolio global search box");
+
+  if (diagnose) {
+    await failWithDiagnostics(page, `Could not find AppFolio global search box during ${context}`, "global-search-not-found");
+  }
+  fail(`Could not find AppFolio global search box during ${context}`);
 }
 
 async function prepareRenewalOffer(page, data) {
   log("Starting renewal offer task");
   const taskPage = await clickRenewalTask(page);
   page = taskPage;
-  await page.waitForLoadState("domcontentloaded").catch(() => {});
-  await page.waitForLoadState("networkidle").catch(() => {});
   const workflowPage = await findPageWithText(
     page.context(),
     /Renewal Notice Letter|Add Renewal Option|Send Renewal Notice Letter|Renewal Preview|Cancel All|Send All to Tenant|Select which option to review/i,
-    15000
+    CONFIG.appfolioActionTimeoutMs
   );
   if (!workflowPage) {
     const bodyPreview = await page.locator("body").innerText({ timeout: 2000 }).catch(() => "");
-    fail(`Could not find renewal workflow page after opening ${page.url()}. Page starts with: ${bodyPreview.slice(0, 250)}`);
+    await failWithDiagnostics(page, `Could not find renewal workflow page after opening ${page.url()}. Page starts with: ${bodyPreview.slice(0, 250)}`, "renewal-workflow-not-found");
   }
   page = workflowPage;
   await page.bringToFront();
@@ -991,31 +1281,30 @@ async function clickRenewalTask(page) {
       if (!task) continue;
 
       const popupPromise = page.context().waitForEvent("page", { timeout: 8000 }).catch(() => null);
+      const previousUrl = page.url();
+      log("TASK_STEP", `Clicking renewal task ${taskName}`);
       await task.click({ force: true });
       const popup = await popupPromise;
       if (popup) {
-        await popup.waitForLoadState("domcontentloaded").catch(() => {});
         await popup.bringToFront();
         return popup;
       }
-
+      await waitForPageText(page, /Renewal Notice Letter|Add Renewal Option|Send Renewal Notice Letter|Renewal Preview|Select which option to review/i, CONFIG.appfolioActionTimeoutMs, `renewal task page after ${previousUrl}`);
       return page;
     }
   }
 
-  fail("Could not find a Prepare/Review/Send Renewal Offer task link");
+  await failWithDiagnostics(page, "Could not find a Prepare/Review/Send Renewal Offer task link", "renewal-task-not-found");
 }
 
 async function waitForRenewalNoticeLetterScreen(page) {
-  await page.waitForLoadState("domcontentloaded").catch(() => {});
-  await page.waitForLoadState("networkidle").catch(() => {});
   const existingPage = await findPageWithText(page.context(), /Send Renewal Notice Letter/i, 20000);
   if (existingPage) {
     await existingPage.bringToFront();
     return existingPage;
   }
 
-  fail("Could not find Send Renewal Notice Letter screen");
+  await failWithDiagnostics(page, "Could not find Send Renewal Notice Letter screen", "renewal-notice-screen-not-found");
 }
 
 async function configureRenewalNoticeLetter(page, data) {
@@ -1026,7 +1315,7 @@ async function configureRenewalNoticeLetter(page, data) {
     });
   await clickReviewRenewalOffer(page);
   const previewPage = await findPageWithText(page.context(), /renewal preview|send all to tenant|cancel all/i, 30000);
-  if (!previewPage) fail("Could not find renewal preview page");
+  if (!previewPage) await failWithDiagnostics(page, "Could not find renewal preview page", "renewal-preview-not-found");
   await previewPage.bringToFront();
   return previewPage;
 }
@@ -1036,13 +1325,22 @@ async function findPageWithText(context, pattern, timeout = 10000) {
   while (Date.now() < deadline) {
     for (const candidate of context.pages()) {
       if (candidate.isClosed()) continue;
-      await candidate.waitForLoadState("domcontentloaded").catch(() => {});
       const bodyText = await candidate.locator("body").innerText({ timeout: 1000 }).catch(() => "");
       if (pattern.test(bodyText)) return candidate;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   return null;
+}
+
+async function waitForPageText(page, pattern, timeout, description) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+    if (pattern.test(bodyText)) return true;
+    await page.waitForTimeout(500);
+  }
+  await failWithDiagnostics(page, `Timed out waiting for ${description}`, "page-text-timeout");
 }
 
 async function configureLeasePreview(page, data) {
@@ -1092,8 +1390,7 @@ async function cancelLeasePreview(page) {
     .or(page.getByRole("button", { name: /^Cancel All$/i }));
   const button = await visibleFirst(cancel, "Cancel All", 10000);
   await button.click();
-  await page.waitForLoadState("domcontentloaded").catch(() => {});
-  await page.waitForLoadState("networkidle").catch(() => {});
+  await page.waitForTimeout(1000);
 }
 
 async function jumpToPreviewSection(page, sectionName) {
@@ -1723,6 +2020,7 @@ async function main() {
 
     log("Launching Playwright", CONFIG.headless ? "headless" : "headed");
     const userDataDir = path.resolve(process.cwd(), process.env.PLAYWRIGHT_USER_DATA_DIR || ".playwright-appfolio-profile");
+    log("Using Playwright persistent profile", userDataDir);
     context = await chromium.launchPersistentContext(userDataDir, {
       headless: CONFIG.headless,
       slowMo: CONFIG.slowMo,
@@ -1735,7 +2033,6 @@ async function main() {
     if (CONFIG.appfolioNoticeUrl) {
       log("Starting from renewal notice URL", CONFIG.appfolioNoticeUrl);
       await page.goto(CONFIG.appfolioNoticeUrl, { waitUntil: "domcontentloaded" });
-      await page.waitForLoadState("networkidle").catch(() => {});
       const noticePage = await waitForRenewalNoticeLetterScreen(page);
       const leasePreviewPage = await configureRenewalNoticeLetter(noticePage, data);
       await configureLeasePreview(leasePreviewPage, data);
@@ -1751,9 +2048,9 @@ async function main() {
       return;
     }
 
-    const screenshotPath = path.resolve(process.cwd(), `appfolio-renewal-error-${Date.now()}.png`);
+    let screenshotPath = "";
     if (page) {
-      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+      screenshotPath = await capturePageDiagnostics(page, "renewal-error", error.message);
     }
     logState("ERROR", error.message);
     if (page) {

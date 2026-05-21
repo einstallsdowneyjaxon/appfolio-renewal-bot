@@ -15,6 +15,32 @@ Optional AppFolio override:
 $env:APPFOLIO_URL="https://thetgpm.appfolio.com"
 ```
 
+## AppFolio session reuse
+
+The bot uses a Playwright persistent browser context so AppFolio cookies, localStorage, and session data survive across runs.
+
+```powershell
+$env:PLAYWRIGHT_USER_DATA_DIR=".playwright-appfolio-profile"
+```
+
+On a server, keep this path stable and writable by the user running Node/n8n. Before trying to log in, the bot opens AppFolio and checks whether the existing profile is already authenticated:
+
+- `SESSION_REUSED` - existing AppFolio session is valid; login and 2FA are skipped.
+- `LOGIN_REQUIRED` - session is missing or expired; the bot starts login.
+- `MFA_REQUIRED` - AppFolio requested 2FA. Background n8n jobs will fail cleanly instead of hanging for terminal input unless `APPFOLIO_MFA_CODE` is provided for that recovery run.
+- `LOGIN_SUCCESS` - login completed and the persistent profile has been refreshed.
+
+Optional one-time recovery setting:
+
+```powershell
+$env:APPFOLIO_MFA_CODE="123456"
+$env:APPFOLIO_LOGIN_TIMEOUT_MS="60000"
+$env:APPFOLIO_ACTION_TIMEOUT_MS="30000"
+$env:APPFOLIO_DIAGNOSTIC_MODE="true"
+```
+
+When AppFolio selectors fail, diagnostic mode logs the current URL, title, page text preview, visible inputs/actions, and writes a screenshot such as `appfolio-global-search-not-found-*.png`.
+
 ## Google Sheet authentication
 
 This bot uses a local Google OAuth client. On the first run it opens a browser so you can approve Google Sheets access. It saves the refresh token locally at `.appfolio-google-token.json`, so future runs do not require another Google login.
