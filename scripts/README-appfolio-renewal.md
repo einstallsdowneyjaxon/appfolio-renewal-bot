@@ -144,5 +144,4 @@ $env:LEASE_RENEWAL_ROW="2"
 $env:LEASE_RENEWAL_TAB="Coco_XR"
 $env:HEADLESS="false"
 $env:PLAYWRIGHT_SLOW_MO="100"
-$env:USE_HARDCODED_TEST_ROW="false"
 ```

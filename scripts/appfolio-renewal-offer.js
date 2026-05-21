@@ -25,7 +25,6 @@ const CONFIG = {
   spreadsheetId: process.env.LEASE_RENEWAL_SPREADSHEET_ID || "",
   googleOAuthClientPath: process.env.GOOGLE_OAUTH_CLIENT_JSON || "C:/Users/Inqui/Downloads/client_secret_172984887894-fao8ei9m253ll9eoi4i3k45q4i54m9s4.apps.googleusercontent.com.json",
   googleOAuthTokenPath: path.resolve(process.cwd(), process.env.GOOGLE_OAUTH_TOKEN_PATH || ".appfolio-google-token.json"),
-  useHardcodedTestRow: parseBoolean(process.env.USE_HARDCODED_TEST_ROW, false),
   appfolioNoticeUrl: process.env.APPFOLIO_NOTICE_URL || "",
   headless: parseBoolean(process.env.HEADLESS, false),
   slowMo: Number(process.env.PLAYWRIGHT_SLOW_MO || "0"),
@@ -542,26 +541,7 @@ async function findSpreadsheetId(auth, spreadsheetName) {
 }
 
 async function readLeaseRenewalRow() {
-  let byColumn;
-  if (CONFIG.useHardcodedTestRow) {
-    log("Using temporary hardcoded row 2 test values", "Google Sheets read is bypassed");
-    byColumn = {
-      unitId: "",
-      tenantName: "Test Testing",
-      renewalRate: "1500",
-      leaseFrom: "06/01/2026",
-      leaseTo: "05/31/2027",
-      earlyTerminationRate: "3,000",
-      addendumsAdded: "",
-      addendumsRemoved: "",
-      addendums: "",
-      renewalLetterOption: "Main",
-      lawn: "Tenant",
-    };
-  } else {
-    byColumn = await readLeaseRenewalRowFromSheet();
-  }
-
+  const byColumn = await readLeaseRenewalRowFromSheet();
   const leaseFromDate = parseSheetDate(byColumn.leaseFrom, COLUMNS.leaseFrom);
   const leaseToDate = parseSheetDate(byColumn.leaseTo, COLUMNS.leaseTo);
   const data = {
@@ -652,7 +632,6 @@ function isCompletedGreen(color) {
 }
 
 async function markProcessedRowGreen() {
-  if (CONFIG.useHardcodedTestRow) return;
   log("Marking Google Sheet row green", `row ${CONFIG.rowNumber}`);
   const auth = await getGoogleAuth();
   const spreadsheetId = CONFIG.spreadsheetId || await findSpreadsheetId(auth, CONFIG.spreadsheetName);
@@ -953,11 +932,7 @@ async function searchTenant(page, tenantName) {
   const searchBox = await findSearchBox(page, CONFIG.appfolioActionTimeoutMs, "tenant search");
 
   log("SEARCH_STEP", "Filling global search box");
-  await replaceInputValue(searchBox, tenantName);
-  log("SEARCH_STEP", "Submitting global search");
-  await searchBox.press("Enter").catch(async () => {
-    await page.keyboard.press("Enter");
-  });
+  await fillGlobalSearch(page, searchBox, tenantName);
   await waitForTenantSearchResponse(page, tenantName);
 
   if (await isTenantPage(page, tenantName)) {
@@ -976,13 +951,66 @@ async function searchTenant(page, tenantName) {
   await failWithDiagnostics(page, `Clicked search result but did not reach tenant page for "${tenantName}". URL: ${page.url()}. Page starts with: ${bodyPreview}`, "tenant-page-not-opened");
 }
 
+async function fillGlobalSearch(page, searchBox, tenantName) {
+  await searchBox.click({ force: true });
+  await replaceInputValue(searchBox, tenantName);
+  await page.waitForTimeout(750);
+
+  let currentValue = await searchBox.inputValue().catch(() => "");
+  if (currentValue.trim() === tenantName.trim()) {
+    log("SEARCH_STEP", "Global search value confirmed");
+    return;
+  }
+
+  log("SEARCH_STEP", `Global search value was "${currentValue}". Retrying through active keyboard input`);
+  await searchBox.click({ force: true });
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
+  await page.keyboard.press("Backspace").catch(() => {});
+  await page.keyboard.type(tenantName, { delay: 35 });
+  await page.waitForTimeout(750);
+
+  currentValue = await searchBox.inputValue().catch(() => "");
+  if (currentValue.trim() === tenantName.trim()) {
+    log("SEARCH_STEP", "Global search value confirmed after keyboard retry");
+    return;
+  }
+
+  const domSetSucceeded = await page.evaluate((value) => {
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    }
+
+    const input = Array.from(document.querySelectorAll("input"))
+      .find((element) => isVisible(element) && /search appfolio/i.test([
+        element.getAttribute("placeholder"),
+        element.getAttribute("aria-label"),
+      ].join(" ")));
+    if (!input) return false;
+
+    input.focus();
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return input.value === value;
+  }, tenantName).catch(() => false);
+  await page.waitForTimeout(750);
+
+  currentValue = await searchBox.inputValue().catch(() => "");
+  if (!domSetSucceeded || currentValue.trim() !== tenantName.trim()) {
+    await failWithDiagnostics(page, `Could not enter tenant name into AppFolio global search. Attempted value "${tenantName}", current value "${currentValue}".`, "global-search-fill-failed");
+  }
+
+  log("SEARCH_STEP", "Global search value confirmed after DOM event retry");
+}
+
 async function waitForTenantSearchResponse(page, tenantName) {
   const deadline = Date.now() + CONFIG.appfolioActionTimeoutMs;
-  const tenantRegex = new RegExp(escapeRegex(tenantName), "i");
   while (Date.now() < deadline) {
     if (await isTenantPage(page, tenantName)) return;
     const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
-    if (tenantRegex.test(bodyText)) {
+    if (tenantNameMatches(bodyText, tenantName)) {
       log("SEARCH_STEP", "Search results contain tenant name");
       return;
     }
@@ -995,18 +1023,27 @@ async function waitForTenantSearchResponse(page, tenantName) {
 }
 
 async function openTenantSearchResult(page, tenantName) {
-  const tenantRegex = new RegExp(escapeRegex(tenantName), "i");
-  await page.waitForFunction((name) => document.body.innerText.toLowerCase().includes(name.toLowerCase()), tenantName, { timeout: 10000 })
+  const tenantRegexes = tenantNameRegexes(tenantName);
+  await page.waitForFunction((name) => {
+    const text = document.body.innerText.toLowerCase();
+    const normalized = String(name || "").toLowerCase();
+    if (text.includes(normalized)) return true;
+    if (normalized.includes(",")) {
+      const [last, rest] = normalized.split(",", 2).map((part) => part.trim()).filter(Boolean);
+      return Boolean(last && rest && text.includes(`${rest} ${last}`));
+    }
+    return false;
+  }, tenantName, { timeout: 10000 })
     .catch(() => {});
 
-  const locators = [
+  const locators = tenantRegexes.flatMap((tenantRegex) => [
     page.getByRole("link", { name: tenantRegex }),
     page.locator("a").filter({ hasText: tenantRegex }),
     page.locator("tr, li, .search-result, .search-results, .list-group-item, .row, [class*='result']")
       .filter({ hasText: tenantRegex })
       .locator("a")
       .first(),
-  ];
+  ]);
 
   for (const locator of locators) {
     const result = await visibleFirst(locator, `tenant search result for ${tenantName}`, 3000).catch(() => null);
@@ -1044,7 +1081,7 @@ async function waitForTenantPageAfterClick(page, tenantName, previousUrl) {
 }
 
 async function findTenantResultHref(page, tenantName) {
-  const href = await page.evaluate((name) => {
+  const href = await page.evaluate((names) => {
     function isVisible(element) {
       const rect = element.getBoundingClientRect();
       const style = window.getComputedStyle(element);
@@ -1055,9 +1092,13 @@ async function findTenantResultHref(page, tenantName) {
       return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
     }
 
-    const target = normalize(name);
+    const targets = names.map(normalize).filter(Boolean);
     const anchors = Array.from(document.querySelectorAll("a[href]"))
-      .filter((anchor) => isVisible(anchor) && normalize(anchor.textContent).includes(target))
+      .filter((anchor) => {
+        if (!isVisible(anchor)) return false;
+        const text = normalize(anchor.textContent);
+        return targets.some((target) => text.includes(target));
+      })
       .map((anchor) => ({
         href: anchor.href,
         text: normalize(anchor.textContent),
@@ -1066,18 +1107,43 @@ async function findTenantResultHref(page, tenantName) {
 
     const preferred = anchors.find(({ href }) => /tenant|occupanc|people|lease/i.test(href));
     return (preferred || anchors[0])?.href || "";
-  }, tenantName);
+  }, tenantNameCandidates(tenantName));
 
   return href || "";
 }
 
 async function isTenantPage(page, tenantName) {
   const bodyText = await page.locator("body").innerText().catch(() => "");
-  const hasTenantName = new RegExp(escapeRegex(tenantName), "i").test(bodyText);
+  const hasTenantName = tenantNameMatches(bodyText, tenantName);
   const hasTenantPageSignals = /Eligible for Renewal|Primary Tenant|Tenant Status|Recurring Charges|Portal Active|Move Out|Delinquency Notes/i.test(bodyText);
-  const hasTaskSignals = /Prepare Renewal Offer|Prepare Renewal Letter|Review Renewal Offer|Send Renewal Offer|Send Renewal Letter/i.test(bodyText);
   const urlLooksTenantish = /tenant|occupanc|lease/i.test(page.url());
-  return hasTenantName && (hasTenantPageSignals || hasTaskSignals || urlLooksTenantish);
+  const isSearchResultsOverlay = /Results\s+Advanced Search|FEEDBACK\s+People/i.test(bodyText) && !urlLooksTenantish;
+  return hasTenantName && !isSearchResultsOverlay && (hasTenantPageSignals || urlLooksTenantish);
+}
+
+function tenantNameCandidates(tenantName) {
+  const raw = String(tenantName || "").replace(/\s+/g, " ").trim();
+  const candidates = [raw];
+  if (raw.includes(",")) {
+    const [last, rest] = raw.split(",", 2).map((part) => part.trim()).filter(Boolean);
+    if (last && rest) candidates.push(`${rest} ${last}`);
+  }
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function tenantNameRegexes(tenantName) {
+  return tenantNameCandidates(tenantName).map((candidate) => new RegExp(escapeRegex(candidate), "i"));
+}
+
+function tenantNameMatches(text, tenantName) {
+  const value = String(text || "");
+  if (tenantNameRegexes(tenantName).some((regex) => regex.test(value))) return true;
+  const tokens = String(tenantName || "")
+    .replace(/[,.'"]/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 1);
+  return tokens.length >= 2 && tokens.every((token) => new RegExp(`\\b${escapeRegex(token)}\\b`, "i").test(value));
 }
 
 async function hasSearchBox(page, timeout = 1000) {
@@ -1185,6 +1251,10 @@ async function prepareRenewalOffer(page, data) {
   log("Configuring renewal option", "2020 Master Renewal Lease");
   await selectCustomDropdownByPlaceholder(page, "Select Lease Template", "2020 Master Renewal Lease");
 
+  log("Clearing pre-existing renewal addenda");
+  const renewalAddendaControl = await findCustomDropdownControlByLabel(page, "Select Addenda Template");
+  await clearCustomDropdown(page, renewalAddendaControl);
+
   for (const addendum of data.addendums) {
     log("Selecting addendum", addendum);
     await selectAddendum(page, addendum);
@@ -1200,7 +1270,7 @@ async function prepareRenewalOffer(page, data) {
   await fillByLabel(page, ["Lease End Date", "End Date"], data.leaseTo);
 
   log("Entering renewal option new rent", data.renewalRate);
-  await fillInputUnderHeader(page, "Add Renewal Option", "Add Another Renewal Option", "New Rent", data.renewalRate, "renewal option new rent");
+  await fillRenewalOptionNewRent(page, data.renewalRate);
 
   await configureMonthToMonthOption(page, data);
   await configureAdditionalSettings(page);
@@ -1722,9 +1792,9 @@ async function continuePromptIfPresent(page) {
 async function configureMonthToMonthOption(page, data) {
   log("Configuring Month To Month option");
   await scrollElementIntoView(page.getByText(/^Add Month To Month Option$/i), "Add Month To Month Option section");
-  const addendaControl = await findCustomDropdownControlInSection(page, "Add Month To Month Option", "Include Addenda");
+  const addendaControl = await findVisibleMonthToMonthAddendaControl(page);
   await clearCustomDropdown(page, addendaControl);
-  await selectCustomDropdownInSection(page, "Add Month To Month Option", "Include Addenda", "Month to Month Unavailable");
+  await selectCustomDropdownControl(page, addendaControl, "Add Month To Month Option Include Addenda", "Month to Month Unavailable");
   log("Entering Month To Month new rent", data.monthToMonthRent);
   await fillInputUnderHeader(page, "Add Month To Month Option", "Additional Fee", "New Rent", data.monthToMonthRent, "Month To Month new rent");
 }
@@ -1855,6 +1925,48 @@ async function fillInputUnderHeader(page, startText, endText, headerText, value,
   await input.press("Tab").catch(() => {});
 }
 
+async function fillRenewalOptionNewRent(page, value) {
+  const inputIndex = await page.evaluate(() => {
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    }
+
+    function cleanText(element) {
+      return (element.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    const elements = Array.from(document.querySelectorAll("body *"));
+    const addAnother = elements
+      .map((element) => ({ element, rect: element.getBoundingClientRect(), text: cleanText(element) }))
+      .filter(({ element, rect, text }) => isVisible(element) && /^Add Another Renewal Option$/i.test(text) && rect.height < 80)
+      .sort((a, b) => a.rect.top - b.rect.top)[0];
+    if (!addAnother) return -1;
+
+    const inputs = Array.from(document.querySelectorAll("input"));
+    const candidates = inputs
+      .map((input, index) => ({ input, index, rect: input.getBoundingClientRect(), type: (input.getAttribute("type") || "text").toLowerCase() }))
+      .filter(({ input, rect, type }) =>
+        isVisible(input)
+        && !["checkbox", "radio", "hidden", "search"].includes(type)
+        && rect.top < addAnother.rect.top
+        && rect.top > 60
+        && rect.left > 650
+        && rect.width > 50
+        && rect.height < 70
+      )
+      .sort((a, b) => (b.rect.top - a.rect.top) || (b.rect.left - a.rect.left));
+
+    return candidates[0]?.index ?? -1;
+  });
+
+  if (inputIndex < 0) fail("Could not find renewal option new rent");
+  const input = page.locator("input").nth(inputIndex);
+  await replaceInputValue(input, value);
+  await input.press("Tab").catch(() => {});
+}
+
 async function replaceInputValue(input, value) {
   await input.click({ force: true });
   await input.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
@@ -1863,10 +1975,34 @@ async function replaceInputValue(input, value) {
 }
 
 async function selectAddendum(page, addendum) {
+  if (await isAddendumAlreadySelected(page, addendum)) {
+    log("Skipping already-selected addendum", addendum);
+    return;
+  }
   const checkbox = await checkByLabel(page, [addendum]).then(() => true).catch(() => false);
   if (checkbox) return;
   const searchText = ADDENDUM_SEARCH_QUERIES.get(normalizeAddendumName(addendum)) || addendum;
   await selectCustomDropdownByPlaceholder(page, "Select Addenda Template", addendum, searchText);
+}
+
+async function isAddendumAlreadySelected(page, addendum) {
+  const selectedValues = await page.evaluate(() => {
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    }
+
+    return Array.from(document.querySelectorAll(".Select-value-label, .Select-value, [class*='multi-value__label']"))
+      .filter(isVisible)
+      .map((element) => element.textContent || "");
+  }).catch(() => []);
+
+  const target = normalizeAddendumName(addendum);
+  return selectedValues.some((value) => {
+    const normalized = normalizeAddendumName(value.replace(/[x×]\s*$/i, ""));
+    return normalized === target;
+  });
 }
 
 async function clearCustomDropdown(page, control) {
@@ -1989,6 +2125,105 @@ async function findCustomDropdownControlInSection(page, sectionHeading, labelTex
   return page.locator(".Select-control").nth(controlIndex);
 }
 
+async function findCustomDropdownControlAfterHeading(page, headingText, labelText) {
+  const controlIndex = await page.evaluate(({ headingText, labelText }) => {
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    }
+
+    function cleanText(element) {
+      return (element.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    const elements = Array.from(document.querySelectorAll("body *"));
+    const heading = elements
+      .map((element) => ({ element, rect: element.getBoundingClientRect(), text: cleanText(element) }))
+      .filter(({ element, rect, text }) =>
+        isVisible(element)
+        && text === headingText
+        && rect.height < 100
+        && rect.width < 900
+      )
+      .sort((a, b) => a.rect.top - b.rect.top)[0];
+    if (!heading) return -1;
+
+    const headingY = heading.rect.top + window.scrollY;
+    const label = elements
+      .map((element) => ({ element, rect: element.getBoundingClientRect(), text: cleanText(element) }))
+      .filter(({ element, rect, text }) =>
+        isVisible(element)
+        && text.includes(labelText)
+        && rect.top + window.scrollY > headingY
+        && rect.height < 80
+        && rect.width < 500
+      )
+      .sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left))[0];
+    if (!label) return -1;
+
+    const controls = Array.from(document.querySelectorAll(".Select-control"));
+    const candidates = controls
+      .map((control, index) => ({ control, index, rect: control.getBoundingClientRect() }))
+      .filter(({ control, rect }) =>
+        isVisible(control)
+        && rect.top + window.scrollY > headingY
+        && rect.left > label.rect.left
+        && Math.abs((rect.top + rect.height / 2) - (label.rect.top + label.rect.height / 2)) < 70
+      )
+      .sort((a, b) => Math.abs((a.rect.top + a.rect.height / 2) - (label.rect.top + label.rect.height / 2))
+        - Math.abs((b.rect.top + b.rect.height / 2) - (label.rect.top + label.rect.height / 2)));
+
+    return candidates[0]?.index ?? -1;
+  }, { headingText, labelText });
+
+  if (controlIndex < 0) fail(`Could not find ${labelText} dropdown after ${headingText}`);
+  return page.locator(".Select-control").nth(controlIndex);
+}
+
+async function findVisibleMonthToMonthAddendaControl(page) {
+  const controlIndex = await page.evaluate(() => {
+    function isActuallyVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0
+        && rect.height > 0
+        && rect.bottom > 0
+        && rect.top < window.innerHeight
+        && style.visibility !== "hidden"
+        && style.display !== "none";
+    }
+
+    function cleanText(element) {
+      return (element.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    const heading = Array.from(document.querySelectorAll("body *"))
+      .map((element) => ({ element, rect: element.getBoundingClientRect(), text: cleanText(element) }))
+      .filter(({ element, rect, text }) =>
+        isActuallyVisible(element)
+        && text === "Add Month To Month Option"
+        && rect.height < 100
+      )
+      .sort((a, b) => a.rect.top - b.rect.top)[0];
+    if (!heading) return -1;
+
+    const controls = Array.from(document.querySelectorAll(".Select-control"))
+      .map((control, index) => ({ control, index, rect: control.getBoundingClientRect(), text: cleanText(control) }))
+      .filter(({ control, rect }) =>
+        isActuallyVisible(control)
+        && rect.top > heading.rect.top
+        && rect.left > 400
+      )
+      .sort((a, b) => (b.rect.height - a.rect.height) || (a.rect.top - b.rect.top));
+
+    return controls[0]?.index ?? -1;
+  });
+
+  if (controlIndex < 0) fail("Could not find Month To Month Include Addenda dropdown");
+  return page.locator(".Select-control").nth(controlIndex);
+}
+
 async function findCustomDropdownControlByLabel(page, placeholderText) {
   const labelText = placeholderText.includes("Addenda")
     ? "Include Addenda"
@@ -2002,6 +2237,52 @@ async function findCustomDropdownControlByLabel(page, placeholderText) {
   ).catch(() => null);
   if (!label) fail(`Could not find dropdown placeholder: ${placeholderText}`);
   return label.locator("xpath=following::*[contains(concat(' ', normalize-space(@class), ' '), ' Select-control ')][1]");
+}
+
+async function findLastCustomDropdownControlByLabel(page, labelText) {
+  const controlIndex = await page.evaluate((labelText) => {
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    }
+
+    function cleanText(element) {
+      return (element.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    const elements = Array.from(document.querySelectorAll("body *"));
+    const labels = elements
+      .map((element) => ({ element, rect: element.getBoundingClientRect(), text: cleanText(element) }))
+      .filter(({ element, rect, text }) =>
+        isVisible(element)
+        && text.includes(labelText)
+        && rect.height < 80
+        && rect.width < 500
+      )
+      .sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left));
+
+    const controls = Array.from(document.querySelectorAll(".Select-control"));
+    const matches = labels
+      .map((label) => {
+        const candidates = controls
+          .map((control, index) => ({ control, index, rect: control.getBoundingClientRect() }))
+          .filter(({ control, rect }) =>
+            isVisible(control)
+            && rect.left > label.rect.left
+            && Math.abs((rect.top + rect.height / 2) - (label.rect.top + label.rect.height / 2)) < 90
+          )
+          .sort((a, b) => Math.abs((a.rect.top + a.rect.height / 2) - (label.rect.top + label.rect.height / 2))
+            - Math.abs((b.rect.top + b.rect.height / 2) - (label.rect.top + label.rect.height / 2)));
+        return candidates[0]?.index ?? -1;
+      })
+      .filter((index) => index >= 0);
+
+    return matches[matches.length - 1] ?? -1;
+  }, labelText);
+
+  if (controlIndex < 0) fail(`Could not find ${labelText} dropdown`);
+  return page.locator(".Select-control").nth(controlIndex);
 }
 
 function escapeRegex(value) {
