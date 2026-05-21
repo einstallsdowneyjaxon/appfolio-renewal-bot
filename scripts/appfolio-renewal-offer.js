@@ -951,6 +951,33 @@ async function searchTenant(page, tenantName) {
   await failWithDiagnostics(page, `Clicked search result but did not reach tenant page for "${tenantName}". URL: ${page.url()}. Page starts with: ${bodyPreview}`, "tenant-page-not-opened");
 }
 
+async function ensurePostLoginReady(page, data) {
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    if (await isTenantPage(page, data.tenantName)) {
+      logState("POST_LOGIN_READY", `Already on tenant page at ${page.url()}`);
+      return;
+    }
+
+    const searchBox = await findSearchBox(page, 1000, "post-login ready", { diagnose: false }).catch(() => null);
+    if (searchBox) {
+      logState("POST_LOGIN_READY", `Authenticated AppFolio search UI ready at ${page.url()}`);
+      return;
+    }
+
+    const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+    if (/Dashboard|Property Manager|Tasks|Add Functionality|Help & Training/i.test(bodyText)
+      && !/Sign In|Log In|Verification Code|Send Verification Code/i.test(bodyText)) {
+      logState("POST_LOGIN_READY", `Authenticated AppFolio page ready at ${page.url()}`);
+      return;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  await failWithDiagnostics(page, `Tenant search did not begin within 30 seconds after login. Current URL: ${page.url()}`, "post-login-tenant-search-not-started");
+}
+
 async function fillGlobalSearch(page, searchBox, tenantName) {
   await searchBox.click({ force: true });
   await replaceInputValue(searchBox, tenantName);
@@ -2318,6 +2345,8 @@ async function main() {
       const leasePreviewPage = await configureRenewalNoticeLetter(noticePage, data);
       await configureLeasePreview(leasePreviewPage, data);
     } else {
+      await ensurePostLoginReady(page, data);
+      logState("STARTING_TENANT_SEARCH", data.tenantName);
       await searchTenant(page, data.tenantName);
       await prepareRenewalOffer(page, data);
     }

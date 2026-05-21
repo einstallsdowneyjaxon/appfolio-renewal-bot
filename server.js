@@ -12,6 +12,8 @@ const completionLogFile = path.join(dataDir, "completion-log.json");
 const renewalJobLogFile = path.join(rootDir, "renewal-job.log");
 const appUrl = `http://127.0.0.1:${port}`;
 const completionWebhookUrl = "https://tgpm.app.n8n.cloud/webhook/25b7e346-ebf6-483f-838f-b5e8ffbc45f7";
+const renewalJobQueue = [];
+let activeRenewalJob = null;
 
 const bucketTypes = ["HVAC", "Plumbing", "Maintenance", "Freestyle"];
 
@@ -243,9 +245,11 @@ function getPayloadRowNumber(payload) {
     payload?.rowNumber ??
     payload?.row ??
     payload?.sheetRow ??
+    payload?.cocoRow ??
     payload?.leaseRenewalRow ??
     payload?.row_number ??
     payload?.sheet_row ??
+    payload?.coco_row ??
     payload?.lease_renewal_row;
 
   const rowNumber = Number(value);
@@ -255,10 +259,83 @@ function getPayloadRowNumber(payload) {
   return rowNumber;
 }
 
-function startRenewalJob(rowNumber) {
-  const jobId = `renewal-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+function createRenewalJob(rowNumber) {
+  return {
+    jobId: `renewal-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    rowNumber,
+    status: "QUEUED",
+    queuedAt: new Date().toISOString(),
+    startedAt: "",
+    finishedAt: "",
+    pid: null,
+  };
+}
+
+function getRenewalQueueSnapshot(job = null) {
+  const queuedJobs = renewalJobQueue.map((entry, index) => ({
+    jobId: entry.jobId,
+    rowNumber: entry.rowNumber,
+    status: entry.status,
+    queuePosition: index + 1,
+    queuedAt: entry.queuedAt,
+  }));
+
+  const queuePosition = job
+    ? renewalJobQueue.findIndex((entry) => entry.jobId === job.jobId) + 1
+    : null;
+
+  return {
+    active: activeRenewalJob
+      ? {
+          jobId: activeRenewalJob.jobId,
+          rowNumber: activeRenewalJob.rowNumber,
+          status: activeRenewalJob.status,
+          pid: activeRenewalJob.pid,
+          startedAt: activeRenewalJob.startedAt,
+        }
+      : null,
+    queued: queuedJobs,
+    queueDepth: renewalJobQueue.length,
+    queuePosition: queuePosition > 0 ? queuePosition : null,
+  };
+}
+
+function enqueueRenewalJob(rowNumber) {
+  const job = createRenewalJob(rowNumber);
+  renewalJobQueue.push(job);
+  appendRenewalJobLog(`JOB_QUEUED job=${job.jobId} rowNumber=${rowNumber} queuePosition=${renewalJobQueue.length} activeJob=${activeRenewalJob?.jobId || ""}`);
+  processRenewalQueue();
+  return job;
+}
+
+function processRenewalQueue() {
+  if (activeRenewalJob || !renewalJobQueue.length) return;
+  const job = renewalJobQueue.shift();
+  startRenewalJob(job);
+}
+
+function finishRenewalJob(job, outcome, detail = "") {
+  if (job.finishedAt) return;
+  job.status = outcome;
+  job.finishedAt = new Date().toISOString();
+  if (outcome === "COMPLETED") {
+    appendRenewalJobLog(`JOB_COMPLETED job=${job.jobId} rowNumber=${job.rowNumber}${detail ? ` ${detail}` : ""}`);
+  } else {
+    appendRenewalJobLog(`JOB_FAILED job=${job.jobId} rowNumber=${job.rowNumber}${detail ? ` ${detail}` : ""}`);
+  }
+
+  if (activeRenewalJob?.jobId === job.jobId) {
+    activeRenewalJob = null;
+  }
+  processRenewalQueue();
+}
+
+function startRenewalJob(job) {
+  activeRenewalJob = job;
+  job.status = "RUNNING";
+  job.startedAt = new Date().toISOString();
   const scriptPath = path.join(rootDir, "scripts", "appfolio-renewal-offer.js");
-  const n8nPayload = JSON.stringify({ rowNumber, jobId });
+  const n8nPayload = JSON.stringify({ rowNumber: job.rowNumber, jobId: job.jobId });
   const child = spawn(process.execPath, [scriptPath], {
     cwd: rootDir,
     env: {
@@ -268,41 +345,48 @@ function startRenewalJob(rowNumber) {
     },
     windowsHide: true,
   });
+  job.pid = child.pid;
 
   let combinedOutput = "";
-  appendRenewalJobLog(`START job=${jobId} rowNumber=${rowNumber} pid=${child.pid}`);
+  appendRenewalJobLog(`JOB_STARTED job=${job.jobId} rowNumber=${job.rowNumber} pid=${child.pid}`);
+  appendRenewalJobLog(`START job=${job.jobId} rowNumber=${job.rowNumber} pid=${child.pid}`);
 
   const logChunk = (streamName, chunk) => {
     const text = chunk.toString();
     combinedOutput += text;
     for (const line of text.split(/\r?\n/).filter(Boolean)) {
-      appendRenewalJobLog(`${streamName} job=${jobId} ${line}`);
+      appendRenewalJobLog(`${streamName} job=${job.jobId} ${line}`);
     }
   };
 
   child.stdout.on("data", (chunk) => logChunk("stdout", chunk));
   child.stderr.on("data", (chunk) => logChunk("stderr", chunk));
   child.on("error", (error) => {
-    appendRenewalJobLog(`ERROR job=${jobId} rowNumber=${rowNumber} spawn failed: ${error.message}`);
+    appendRenewalJobLog(`ERROR job=${job.jobId} rowNumber=${job.rowNumber} spawn failed: ${error.message}`);
+    finishRenewalJob(job, "FAILED", `spawnError="${error.message}"`);
   });
   child.on("close", (code, signal) => {
     if (/\bSKIPPED\b/.test(combinedOutput)) {
-      appendRenewalJobLog(`SKIPPED job=${jobId} rowNumber=${rowNumber} exitCode=${code}`);
+      appendRenewalJobLog(`SKIPPED job=${job.jobId} rowNumber=${job.rowNumber} exitCode=${code}`);
+      finishRenewalJob(job, "COMPLETED", `result=SKIPPED exitCode=${code}`);
       return;
     }
     if (code === 0 && /\bSUCCESS\b/.test(combinedOutput)) {
-      appendRenewalJobLog(`SUCCESS job=${jobId} rowNumber=${rowNumber} exitCode=0`);
+      appendRenewalJobLog(`SUCCESS job=${job.jobId} rowNumber=${job.rowNumber} exitCode=0`);
+      finishRenewalJob(job, "COMPLETED", "result=SUCCESS exitCode=0");
       return;
     }
     if (code === 0) {
-      appendRenewalJobLog(`SUCCESS job=${jobId} rowNumber=${rowNumber} exitCode=0`);
+      appendRenewalJobLog(`SUCCESS job=${job.jobId} rowNumber=${job.rowNumber} exitCode=0`);
+      finishRenewalJob(job, "COMPLETED", "result=EXIT_0 exitCode=0");
       return;
     }
-    appendRenewalJobLog(`ERROR job=${jobId} rowNumber=${rowNumber} exitCode=${code} signal=${signal || ""}`);
+    appendRenewalJobLog(`ERROR job=${job.jobId} rowNumber=${job.rowNumber} exitCode=${code} signal=${signal || ""}`);
+    finishRenewalJob(job, "FAILED", `exitCode=${code} signal=${signal || ""}`);
   });
 
   child.unref();
-  return { jobId, pid: child.pid };
+  return job;
 }
 
 async function postCompletionToN8n(payload) {
@@ -418,19 +502,35 @@ async function handleApi(request, response, pathname) {
     if (!rowNumber) {
       sendJson(response, 400, {
         success: false,
-        error: "POST /run-renewal requires rowNumber, row, sheetRow, or leaseRenewalRow as an integer >= 2.",
+        error: "POST /run-renewal requires rowNumber, row, sheetRow, cocoRow, or leaseRenewalRow as an integer >= 2.",
       });
       return true;
     }
 
-    const job = startRenewalJob(rowNumber);
+    const job = enqueueRenewalJob(rowNumber);
+    const queue = getRenewalQueueSnapshot(job);
+    const isRunning = activeRenewalJob?.jobId === job.jobId;
     sendJson(response, 202, {
       success: true,
-      status: "STARTED",
-      message: "Renewal job accepted. Playwright is running in the background.",
+      status: isRunning ? "STARTED" : "QUEUED",
+      message: isRunning
+        ? "Renewal job accepted. Playwright is running in the background."
+        : "Renewal job accepted and queued. It will run after earlier renewal jobs finish.",
       rowNumber,
       jobId: job.jobId,
       pid: job.pid,
+      queuePosition: isRunning ? 0 : queue.queuePosition,
+      activeJobId: queue.active?.jobId || null,
+      queueDepth: queue.queueDepth,
+      logFile: renewalJobLogFile,
+    });
+    return true;
+  }
+
+  if (pathname === "/run-renewal/status" && request.method === "GET") {
+    sendJson(response, 200, {
+      success: true,
+      ...getRenewalQueueSnapshot(),
       logFile: renewalJobLogFile,
     });
     return true;
