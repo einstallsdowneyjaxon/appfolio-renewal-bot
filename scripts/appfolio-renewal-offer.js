@@ -1322,57 +1322,100 @@ async function ensurePostLoginReady(page, data) {
 }
 
 async function fillGlobalSearch(page, searchBox, tenantName) {
-  await searchBox.click({ force: true });
-  await replaceInputValue(searchBox, tenantName);
-  await page.waitForTimeout(750);
+  let currentValue = "";
+  try {
+    await searchBox.click({ force: true });
+    await replaceInputValue(searchBox, tenantName);
+    await page.waitForTimeout(750);
+    currentValue = await searchBox.inputValue().catch(() => "");
+  } catch (error) {
+    log("SEARCH_STEP", `Primary global search fill failed: ${error.message}`);
+  }
 
-  let currentValue = await searchBox.inputValue().catch(() => "");
   if (currentValue.trim() === tenantName.trim()) {
     log("SEARCH_STEP", "Global search value confirmed");
     return;
   }
 
   log("SEARCH_STEP", `Global search value was "${currentValue}". Retrying through active keyboard input`);
-  await searchBox.click({ force: true });
-  await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
-  await page.keyboard.press("Backspace").catch(() => {});
-  await page.keyboard.type(tenantName, { delay: 35 });
-  await page.waitForTimeout(750);
+  try {
+    const retrySearchBox = await findSearchBox(page, 3000, "tenant search retry", { diagnose: false }).catch(() => searchBox);
+    await retrySearchBox.click({ force: true });
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
+    await page.keyboard.press("Backspace").catch(() => {});
+    await page.keyboard.type(tenantName, { delay: 35 });
+    await page.waitForTimeout(750);
+    currentValue = await retrySearchBox.inputValue().catch(() => "");
+    searchBox = retrySearchBox;
+  } catch (error) {
+    log("SEARCH_STEP", `Keyboard global search retry failed: ${error.message}`);
+  }
 
-  currentValue = await searchBox.inputValue().catch(() => "");
   if (currentValue.trim() === tenantName.trim()) {
     log("SEARCH_STEP", "Global search value confirmed after keyboard retry");
     return;
   }
 
-  const domSetSucceeded = await page.evaluate((value) => {
+  const domResult = await setGlobalSearchByDom(page, tenantName);
+  await page.waitForTimeout(750);
+
+  currentValue = domResult.value || await readGlobalSearchValueByDom(page);
+  if (!domResult.ok || currentValue.trim() !== tenantName.trim()) {
+    await failWithDiagnostics(page, `Could not enter tenant name into AppFolio global search. Attempted value "${tenantName}", current value "${currentValue}".`, "global-search-fill-failed");
+  }
+
+  log("SEARCH_STEP", "Global search value confirmed after DOM event retry");
+}
+
+async function setGlobalSearchByDom(page, tenantName) {
+  return page.evaluate((value) => {
     function isVisible(element) {
       const rect = element.getBoundingClientRect();
       const style = window.getComputedStyle(element);
       return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
     }
 
-    const input = Array.from(document.querySelectorAll("input"))
-      .find((element) => isVisible(element) && /search appfolio/i.test([
+    const selectors = [
+      "#global-search-input",
+      "input[type='search']",
+      "input[placeholder*='Search' i]",
+      "input[aria-label*='Search' i]",
+      "input[name*='search' i]",
+    ];
+    const candidates = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+    const input = candidates.find((element) => isVisible(element) && /search|appfolio/i.test([
+        element.id,
         element.getAttribute("placeholder"),
         element.getAttribute("aria-label"),
+        element.getAttribute("name"),
+        element.className,
       ].join(" ")));
-    if (!input) return false;
+    if (!input) return { ok: false, value: "" };
 
     input.focus();
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
     input.value = value;
     input.dispatchEvent(new Event("input", { bubbles: true }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
-    return input.value === value;
-  }, tenantName).catch(() => false);
-  await page.waitForTimeout(750);
+    input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: value.slice(-1) || " " }));
+    input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: value.slice(-1) || " " }));
+    return { ok: input.value === value, value: input.value };
+  }, tenantName).catch(() => ({ ok: false, value: "" }));
+}
 
-  currentValue = await searchBox.inputValue().catch(() => "");
-  if (!domSetSucceeded || currentValue.trim() !== tenantName.trim()) {
-    await failWithDiagnostics(page, `Could not enter tenant name into AppFolio global search. Attempted value "${tenantName}", current value "${currentValue}".`, "global-search-fill-failed");
-  }
+async function readGlobalSearchValueByDom(page) {
+  return page.evaluate(() => {
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    }
 
-  log("SEARCH_STEP", "Global search value confirmed after DOM event retry");
+    const input = Array.from(document.querySelectorAll("#global-search-input, input[type='search'], input[placeholder*='Search' i], input[aria-label*='Search' i]"))
+      .find((element) => isVisible(element));
+    return input?.value || "";
+  }).catch(() => "");
 }
 
 async function waitForTenantSearchResponse(page, tenantName) {
