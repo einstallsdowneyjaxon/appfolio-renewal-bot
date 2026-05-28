@@ -27,10 +27,35 @@ On a server, keep this path stable and writable by the user running Node/n8n. Be
 
 - `SESSION_REUSED` - existing AppFolio session is valid; login and 2FA are skipped.
 - `LOGIN_REQUIRED` - session is missing or expired; the bot starts login.
-- `MFA_REQUIRED` - AppFolio requested 2FA. Background n8n jobs will fail cleanly instead of hanging for terminal input unless `APPFOLIO_MFA_CODE` is provided for that recovery run.
+- `MFA_REQUIRED` - AppFolio requested 2FA. The bot selects SMS, clicks `Send Verification Code`, opens GetMyMFA, reads the latest code, enters it in AppFolio, and continues.
 - `LOGIN_SUCCESS` - login completed and the persistent profile has been refreshed.
 
-Optional one-time recovery setting:
+Expected MFA logs:
+
+```text
+LOGIN_CREDENTIALS_FILLED
+MFA_REQUIRED
+MFA_SMS_SELECTED
+MFA_CODE_REQUESTED
+GETMYMFA_DASHBOARD_LOGIN_STARTED
+GETMYMFA_DASHBOARD_LOGIN_SUCCESS
+GETMYMFA_ACCESS_LAST_CODE_CLICKED
+GETMYMFA_DASHBOARD_CODE_FOUND
+MFA_CODE_TYPED
+MFA_SUBMIT_CLICKED
+LOGIN_SUCCESS
+```
+
+GetMyMFA dashboard settings:
+
+```powershell
+$env:GETMYMFA_URL="https://client.get.mymfa.io/"
+$env:GETMYMFA_USERNAME="your-getmymfa-username"
+$env:GETMYMFA_PASSWORD="your-getmymfa-password"
+$env:GETMYMFA_PHONE_NUMBER="+16266104061"
+```
+
+Optional one-time recovery setting if GetMyMFA is unavailable:
 
 ```powershell
 $env:APPFOLIO_MFA_CODE="123456"

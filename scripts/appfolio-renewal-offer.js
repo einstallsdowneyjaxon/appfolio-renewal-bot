@@ -31,6 +31,10 @@ const CONFIG = {
   appfolioMfaCode: process.env.APPFOLIO_MFA_CODE || "",
   appfolioLoginTimeoutMs: Number(process.env.APPFOLIO_LOGIN_TIMEOUT_MS || "60000"),
   appfolioActionTimeoutMs: Number(process.env.APPFOLIO_ACTION_TIMEOUT_MS || "30000"),
+  getMyMfaUrl: process.env.GETMYMFA_URL || "https://client.get.mymfa.io/",
+  getMyMfaUsername: process.env.GETMYMFA_USERNAME || "",
+  getMyMfaPassword: process.env.GETMYMFA_PASSWORD || "",
+  getMyMfaPhoneNumber: process.env.GETMYMFA_PHONE_NUMBER || "+16266104061",
   diagnosticMode: parseBoolean(process.env.APPFOLIO_DIAGNOSTIC_MODE, true),
 };
 
@@ -822,6 +826,12 @@ async function login(page, username, password) {
   }
 
   logState("LOGIN_REQUIRED", "Existing AppFolio session is missing or expired");
+  if (await handleExistingMfaScreen(page, loginStartedAt)) {
+    await findSearchBox(page, CONFIG.appfolioActionTimeoutMs, "after AppFolio MFA login");
+    logState("LOGIN_SUCCESS", "AppFolio authenticated session saved in persistent browser profile");
+    return;
+  }
+
   log("LOGIN_STEP", "Waiting for login form");
   await waitForLoginForm(page, loginStartedAt);
   log("LOGIN_STEP", "Login form detected");
@@ -833,6 +843,7 @@ async function login(page, username, password) {
   log("LOGIN_STEP", "Filling password");
   await fillByLabel(page, ["password"], password);
   log("LOGIN_STEP", "Password filled");
+  logState("LOGIN_CREDENTIALS_FILLED", "Filled AppFolio username and password from environment");
 
   log("LOGIN_STEP", "Clicking login button");
   await clickByRoleOrText(page, "sign in|log in|login", "login button");
@@ -842,32 +853,7 @@ async function login(page, username, password) {
   log("LOGIN_STEP", `Login outcome detected: ${firstOutcome}`);
 
   if (firstOutcome === "mfa") {
-    logState("MFA_REQUIRED", "AppFolio requested 2-step verification");
-    const sendCodeButton = await page.getByRole("button", { name: /send verification code/i }).first()
-      .isVisible()
-      .catch(() => false);
-    if (sendCodeButton) {
-      log("LOGIN_STEP", "Clicking Send Verification Code");
-      await clickByRoleOrText(page, "send verification code", "Send Verification Code button");
-      log("LOGIN_STEP", "Send Verification Code clicked");
-    }
-
-    const verificationCode = CONFIG.appfolioMfaCode;
-    if (!verificationCode) {
-      fail("MFA_REQUIRED: AppFolio requested verification. Reuse an authenticated PLAYWRIGHT_USER_DATA_DIR session or provide APPFOLIO_MFA_CODE for this run.");
-    }
-
-    if (await isSignedIn(page)) {
-      logState("LOGIN_SUCCESS", "AppFolio authenticated after MFA send step");
-      return;
-    }
-
-    log("LOGIN_STEP", "Entering AppFolio verification code");
-    await fillByLabel(page, ["Verification Code", "Code", "Security Code"], verificationCode);
-    log("LOGIN_STEP", "Verification code filled");
-    log("LOGIN_STEP", "Clicking MFA submit button");
-    await clickByRoleOrText(page, "verify|submit|continue|sign in|log in", "2-step verification submit button");
-    log("LOGIN_STEP", "MFA submit clicked; waiting for signed-in UI");
+    await handleMfa(page, loginStartedAt);
     const mfaOutcome = await waitForLoginOutcome(page, loginStartedAt);
     log("LOGIN_STEP", `Post-MFA outcome detected: ${mfaOutcome}`);
   }
@@ -878,6 +864,51 @@ async function login(page, username, password) {
   }
   await findSearchBox(page, CONFIG.appfolioActionTimeoutMs, "after AppFolio login");
   logState("LOGIN_SUCCESS", "AppFolio authenticated session saved in persistent browser profile");
+}
+
+async function handleExistingMfaScreen(page, loginStartedAt) {
+  const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+  if (await isMfaChoiceScreen(page, bodyText) || isMfaCodeEntryScreen(bodyText)) {
+    await handleMfa(page, loginStartedAt);
+    return true;
+  }
+  return false;
+}
+
+async function handleMfa(page, loginStartedAt) {
+  const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+  if (await isMfaChoiceScreen(page, bodyText)) {
+    await requestSmsVerificationCode(page);
+  } else {
+    logState("MFA_REQUIRED", "AppFolio requested MFA code entry");
+  }
+
+  if (await isSignedIn(page)) {
+    logState("LOGIN_SUCCESS", "AppFolio authenticated after MFA step");
+    return;
+  }
+
+  const verificationCode = await getMfaCodeFromDashboard(page);
+  if (!verificationCode) {
+    if (!CONFIG.appfolioMfaCode) {
+      fail("MFA_REQUIRED: AppFolio requested verification and GetMyMFA did not return a code.");
+    }
+    await fillMfaCode(page, CONFIG.appfolioMfaCode);
+  } else {
+    await fillMfaCode(page, verificationCode);
+  }
+
+  logState("MFA_CODE_TYPED", "Entered verification code into AppFolio");
+  await clickMfaSubmitButton(page);
+  logState("MFA_SUBMIT_CLICKED", "Clicked AppFolio MFA submit button");
+
+  const deadline = loginStartedAt + CONFIG.appfolioLoginTimeoutMs;
+  while (Date.now() < deadline) {
+    if (await isSignedIn(page)) return;
+    await page.waitForTimeout(500);
+  }
+  await saveLoginHangScreenshot(page, "mfa-login-not-complete");
+  fail(`AppFolio MFA login did not complete within ${CONFIG.appfolioLoginTimeoutMs}ms`);
 }
 
 async function waitForLoginForm(page, startedAt) {
@@ -902,7 +933,7 @@ async function waitForLoginOutcome(page, startedAt) {
   while (Date.now() - startedAt < CONFIG.appfolioLoginTimeoutMs) {
     if (await isSignedIn(page)) return "signed-in";
     const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
-    if (/2-Step Verification|Send Verification Code|verification code|multi-factor|mfa/i.test(bodyText)) return "mfa";
+    if (await isMfaChoiceScreen(page, bodyText) || isMfaCodeEntryScreen(bodyText)) return "mfa";
     if (/invalid|incorrect|could not log|try again|account locked/i.test(bodyText)) {
       await saveLoginHangScreenshot(page, "login-error");
       fail(`AppFolio login page reported an error. Page text starts with: ${bodyText.slice(0, 300)}`);
@@ -912,6 +943,318 @@ async function waitForLoginOutcome(page, startedAt) {
 
   await saveLoginHangScreenshot(page, "login-outcome-timeout");
   fail(`AppFolio login did not complete within ${CONFIG.appfolioLoginTimeoutMs}ms`);
+}
+
+async function isMfaChoiceScreen(page, bodyText) {
+  const hasMfaChoiceControls = await page.evaluate(() => {
+    const sms = document.querySelector("#method-sms, input[name='twoFactorMethod'][value*='sms' i]");
+    const send = document.querySelector("#send_verification_code, input[name='send_verification_code']");
+    return Boolean(sms && send);
+  }).catch(() => false);
+  if (hasMfaChoiceControls) return true;
+
+  const hasVerificationPrompt = /2-step verification|two-step verification|verification method/i.test(bodyText);
+  const hasSmsOption = /receive code via sms|sms/i.test(bodyText);
+  const hasAlternateDeliveryOption = /receive code via phone call|phone call|call/i.test(bodyText);
+  const hasSendButtonText = /send verification code/i.test(bodyText);
+  return hasVerificationPrompt && hasSmsOption && (hasAlternateDeliveryOption || hasSendButtonText);
+}
+
+function isMfaCodeEntryScreen(bodyText) {
+  return /2-step verification|two-step verification|verification code|enter.*code|mfa/i.test(bodyText) &&
+    !/receive code via sms|receive code via phone call|send verification code/i.test(bodyText);
+}
+
+async function requestSmsVerificationCode(page) {
+  logState("MFA_REQUIRED", "AppFolio requested 2-Step Verification method selection");
+  await selectSmsVerificationMethod(page);
+  await clickSendVerificationCode(page);
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForTimeout(1000);
+  logState("MFA_CODE_REQUESTED", "Clicked Send Verification Code after selecting SMS");
+}
+
+async function selectSmsVerificationMethod(page) {
+  const directSmsRadio = page.locator("#method-sms, input[name='twoFactorMethod'][value*='sms' i]").first();
+  if (await directSmsRadio.isVisible({ timeout: 1000 }).catch(() => false)) {
+    if (!await directSmsRadio.isChecked().catch(() => false)) await directSmsRadio.check({ force: true });
+    logState("MFA_SMS_SELECTED", "Selected SMS verification radio");
+    return;
+  }
+
+  const selected = await page.evaluate(() => {
+    const labels = Array.from(document.querySelectorAll("label"));
+    const smsLabel = labels.find((label) => /receive code via sms|sms/i.test(label.innerText || label.textContent || ""));
+    if (smsLabel) {
+      const forId = smsLabel.getAttribute("for");
+      const radio = forId ? document.getElementById(forId) : smsLabel.querySelector("input[type='radio']");
+      if (radio && radio instanceof HTMLInputElement) {
+        radio.checked = true;
+        radio.dispatchEvent(new Event("input", { bubbles: true }));
+        radio.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }
+      smsLabel.click();
+      return true;
+    }
+    return false;
+  });
+  if (!selected) fail("Could not select AppFolio SMS verification option");
+  logState("MFA_SMS_SELECTED", "Selected SMS verification option");
+}
+
+async function clickSendVerificationCode(page) {
+  const directButton = page.locator("#send_verification_code, input[name='send_verification_code']").first();
+  if (await directButton.isVisible({ timeout: 1000 }).catch(() => false)) {
+    await directButton.click({ force: true });
+    return;
+  }
+
+  const clicked = await page.evaluate(() => {
+    const controls = Array.from(document.querySelectorAll("button, a, [role='button'], input[type='submit'], input[type='button']"));
+    const sendControl = controls.find((control) => /send verification code/i.test(`${control.innerText || ""} ${control.textContent || ""} ${control.value || ""} ${control.id || ""} ${control.name || ""}`));
+    if (!sendControl) return false;
+    sendControl.click();
+    return true;
+  }).catch(() => false);
+  if (clicked) return;
+
+  await clickByRoleOrText(page, /send verification code/i, "Send Verification Code button");
+}
+
+async function fillMfaCode(page, code) {
+  const codeField = page.locator("#user-verification-code, input[name='code'], input[type='number'], input[type='tel'], input[type='text']").first();
+  const field = await visibleFirst(codeField, "AppFolio verification code", CONFIG.appfolioActionTimeoutMs);
+  await field.fill(String(code).replace(/\D/g, ""));
+  await field.press("Tab").catch(() => {});
+}
+
+async function clickMfaSubmitButton(page) {
+  const submit = page.locator("button, a, [role='button'], input[type='submit']").filter({ hasText: /verify|submit|continue|sign in|log in|login/i })
+    .or(page.locator("input[type='submit'][value*='Log in' i], input[type='submit'][value*='Verify' i], input[type='submit'][value*='Continue' i]"));
+  const button = await visibleFirst(submit, "AppFolio MFA submit button", CONFIG.appfolioActionTimeoutMs);
+  await button.click({ force: true });
+}
+
+async function getMfaCodeFromDashboard(appfolioPage) {
+  if (!CONFIG.getMyMfaUsername || !CONFIG.getMyMfaPassword || !CONFIG.getMyMfaPhoneNumber) {
+    logState("GETMYMFA_DASHBOARD_NOT_CONFIGURED", "GETMYMFA_USERNAME, GETMYMFA_PASSWORD, or GETMYMFA_PHONE_NUMBER is missing");
+    return "";
+  }
+
+  const dashboardPage = await appfolioPage.context().newPage();
+  try {
+    logState("GETMYMFA_DASHBOARD_LOGIN_STARTED", `Opening ${CONFIG.getMyMfaUrl}`);
+    await dashboardPage.goto(CONFIG.getMyMfaUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.appfolioActionTimeoutMs });
+    await loginToGetMyMfaDashboard(dashboardPage);
+    logState("GETMYMFA_DASHBOARD_LOGIN_SUCCESS", "GetMyMFA dashboard loaded");
+    await clickAccessLastMfaCode(dashboardPage);
+    logState("GETMYMFA_ACCESS_LAST_CODE_CLICKED", `Clicked Access last MFA code for ${CONFIG.getMyMfaPhoneNumber}`);
+    const code = await readDashboardMfaCode(dashboardPage);
+    logState("GETMYMFA_DASHBOARD_CODE_FOUND", "Read 6-digit MFA code from GetMyMFA dashboard");
+    await appfolioPage.bringToFront();
+    return code;
+  } catch (error) {
+    const bodyText = await dashboardPage.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+    logState("GETMYMFA_DASHBOARD_FAILED", `${error.message} url=${dashboardPage.url()} body=${bodyText.slice(0, 300).replace(/\s+/g, " ")}`);
+    await appfolioPage.bringToFront().catch(() => {});
+    return "";
+  } finally {
+    await dashboardPage.close().catch(() => {});
+  }
+}
+
+async function loginToGetMyMfaDashboard(page) {
+  if (await isGetMyMfaDashboardVisible(page).catch(() => false)) {
+    logState("GETMYMFA_SESSION_REUSED", "Existing GetMyMFA dashboard session is valid");
+    return;
+  }
+
+  await waitForGetMyMfaLoginOrDashboard(page);
+  if (await isGetMyMfaDashboardVisible(page).catch(() => false)) {
+    logState("GETMYMFA_SESSION_REUSED", "Existing GetMyMFA dashboard session is valid");
+    return;
+  }
+
+  await fillLoginLocator(page, getGetMyMfaUsernameInput(page), CONFIG.getMyMfaUsername, "GetMyMFA username");
+  await fillLoginLocator(page, page.locator("input[type='password']").first(), CONFIG.getMyMfaPassword, "GetMyMFA password");
+  await clickGetMyMfaSubmit(page);
+  await waitForGetMyMfaDashboard(page);
+}
+
+async function waitForGetMyMfaLoginOrDashboard(page) {
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForLoadState("networkidle", { timeout: Math.min(CONFIG.appfolioActionTimeoutMs, 10000) }).catch(() => {});
+
+  const deadline = Date.now() + CONFIG.appfolioActionTimeoutMs;
+  while (Date.now() < deadline) {
+    if (await isGetMyMfaDashboardVisible(page).catch(() => false)) return;
+    const hasLoginInputs = await getGetMyMfaUsernameInput(page).isVisible({ timeout: 500 }).catch(() => false) &&
+      await page.locator("input[type='password']").first().isVisible({ timeout: 500 }).catch(() => false);
+    if (hasLoginInputs) return;
+    await page.waitForTimeout(500);
+  }
+}
+
+function getGetMyMfaUsernameInput(page) {
+  return page.locator([
+    "input[type='email']",
+    "input[name*='email' i]",
+    "input[id*='email' i]",
+    "input[name*='user' i]",
+    "input[id*='user' i]",
+    "input[autocomplete='username']",
+    "input[type='text']",
+    "input:not([type])",
+  ].join(", ")).first();
+}
+
+async function fillLoginLocator(page, locator, value, description) {
+  const input = await visibleFirst(locator, description, CONFIG.appfolioActionTimeoutMs);
+  await input.fill(String(value));
+  await input.press("Tab").catch(() => {});
+}
+
+async function isGetMyMfaDashboardVisible(page) {
+  const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+  if (/my phone numbers|access last mfa code/i.test(bodyText)) return true;
+  return page.getByText(/access last mfa code/i).first().isVisible({ timeout: 500 }).catch(() => false);
+}
+
+async function waitForGetMyMfaDashboard(page) {
+  const deadline = Date.now() + CONFIG.appfolioLoginTimeoutMs;
+  while (Date.now() < deadline) {
+    if (await isGetMyMfaDashboardVisible(page)) return;
+    await page.waitForTimeout(500);
+  }
+  fail("GetMyMFA dashboard login did not complete before timeout.");
+}
+
+async function clickAccessLastMfaCode(page) {
+  await waitForGetMyMfaPhoneNumber(page);
+  const attempts = [
+    () => clickAccessTileByLocator(page),
+    () => clickAccessTileByCoordinates(page),
+    () => clickAccessTileByDom(page),
+  ];
+
+  for (const attempt of attempts) {
+    await attempt().catch(() => false);
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    await page.waitForTimeout(1200);
+    if (await isGetMyMfaCodePageVisible(page)) return;
+  }
+
+  fail("Clicked Access last MFA code but GetMyMFA code page did not open.");
+}
+
+async function clickAccessTileByLocator(page) {
+  const accessTile = await visibleFirst(
+    page.getByText(/access last mfa code/i).or(page.locator("button, a, [role='button'], input[type='button'], input[type='submit'], div, span").filter({ hasText: /access last mfa code/i })),
+    "Access last MFA code action",
+    5000,
+  );
+  await accessTile.click({ force: true });
+}
+
+async function clickAccessTileByCoordinates(page) {
+  const box = await page.getByText(/access last mfa code/i).first().boundingBox();
+  if (!box) return false;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForTimeout(300);
+  await page.mouse.click(box.x + box.width / 2, Math.max(0, box.y - 36));
+  return true;
+}
+
+async function clickAccessTileByDom(page) {
+  return page.evaluate((phoneNumber) => {
+    const normalize = (value) => String(value || "").replace(/\D/g, "");
+    const target = normalize(phoneNumber);
+    const elements = Array.from(document.querySelectorAll("body *"));
+    const phoneElement = elements.find((element) => normalize(element.textContent).includes(target));
+    const accessTextElement = elements.find((element) => /^access last mfa code$/i.test((element.textContent || "").trim()));
+    const clickElement = (element) => {
+      if (!element) return false;
+      const clickable = element.closest("button, a, [role='button'], input[type='button'], input[type='submit'], [onclick]") || element;
+      clickable.scrollIntoView({ block: "center", inline: "center" });
+      clickable.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window }));
+      clickable.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+      clickable.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, view: window }));
+      clickable.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+      clickable.click();
+      return true;
+    };
+
+    if (phoneElement && accessTextElement) {
+      const phoneTop = phoneElement.getBoundingClientRect().top;
+      const accessTop = accessTextElement.getBoundingClientRect().top;
+      if (Math.abs(accessTop - phoneTop) < 300 && clickElement(accessTextElement)) return true;
+    }
+
+    let container = phoneElement || accessTextElement;
+    for (let depth = 0; depth < 12 && container; depth += 1) {
+      const controls = Array.from(container.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit'], [onclick], div, span"));
+      const accessControl = controls.find((control) => /access last mfa code/i.test(control.innerText || control.textContent || control.value || ""));
+      if (clickElement(accessControl)) return true;
+      if (/access last mfa code/i.test(container.innerText || container.textContent || "") && clickElement(container)) return true;
+      container = container.parentElement;
+    }
+
+    return clickElement(accessTextElement);
+  }, CONFIG.getMyMfaPhoneNumber);
+}
+
+async function waitForGetMyMfaPhoneNumber(page) {
+  const target = normalizeDigits(CONFIG.getMyMfaPhoneNumber);
+  const deadline = Date.now() + CONFIG.appfolioActionTimeoutMs;
+  while (Date.now() < deadline) {
+    const found = await page.evaluate((digits) => document.body?.innerText?.replace(/\D/g, "").includes(digits), target).catch(() => false);
+    if (found) return;
+    await page.waitForTimeout(500);
+  }
+  fail(`GetMyMFA phone number was not visible on dashboard: ${CONFIG.getMyMfaPhoneNumber}`);
+}
+
+async function isGetMyMfaCodePageVisible(page) {
+  const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+  return /last mfa code for/i.test(bodyText) || Boolean(extractSixDigitMfaCode(bodyText));
+}
+
+async function readDashboardMfaCode(page) {
+  const deadline = Date.now() + CONFIG.appfolioActionTimeoutMs;
+  while (Date.now() < deadline) {
+    const bodyText = await page.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+    const code = extractSixDigitMfaCode(bodyText);
+    if (code) return code;
+    await page.waitForTimeout(500);
+  }
+  fail("Could not find a 6-digit MFA code on GetMyMFA dashboard.");
+}
+
+function extractSixDigitMfaCode(text) {
+  const value = String(text || "");
+  const contiguousCandidates = value.match(/\b\d{6}\b/g) || [];
+  if (contiguousCandidates.length) return contiguousCandidates[contiguousCandidates.length - 1];
+
+  const spacedCandidates = value.match(/(?:\b\d\s+){5}\d\b/g) || [];
+  if (spacedCandidates.length) return normalizeDigits(spacedCandidates[spacedCandidates.length - 1]);
+
+  return "";
+}
+
+async function clickGetMyMfaSubmit(page) {
+  const button = await visibleFirst(
+    page.locator("button, a, [role='button'], input[type='submit']").filter({ hasText: /log in|login|sign in|continue|submit/i }).or(page.locator("input[type='submit']")),
+    "GetMyMFA login button",
+    CONFIG.appfolioActionTimeoutMs,
+  );
+  await button.click({ force: true });
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForTimeout(1000);
+}
+
+function normalizeDigits(value) {
+  return String(value || "").replace(/\D/g, "");
 }
 
 async function saveLoginHangScreenshot(page, label) {
