@@ -703,6 +703,11 @@ async function clickByRoleOrText(page, name, description = name) {
 }
 
 async function fillByLabel(page, labels, value) {
+  if (await fillByLabelIfPresent(page, labels, value)) return;
+  fail(`Could not find field for labels: ${labels.join(", ")}`);
+}
+
+async function fillByLabelIfPresent(page, labels, value) {
   for (const label of labels) {
     const regex = new RegExp(label, "i");
     const locators = [
@@ -718,10 +723,10 @@ async function fillByLabel(page, labels, value) {
       if (!field) continue;
       await field.fill(String(value));
       await field.press("Tab").catch(() => {});
-      return;
+      return true;
     }
   }
-  fail(`Could not find field for labels: ${labels.join(", ")}`);
+  return false;
 }
 
 async function checkByLabel(page, labels) {
@@ -1672,9 +1677,14 @@ async function prepareRenewalOffer(page, data) {
     log("Selecting addendum", addendum);
     await selectAddendum(page, addendum);
   }
+  await closeOpenSelectDropdowns(page, "renewal addenda");
 
   log("Entering county", "Duval");
-  await fillByLabel(page, ["County"], "Duval");
+  if (await fillByLabelIfPresent(page, ["County"], "Duval")) {
+    log("COUNTY_FIELD_FILLED", "Duval");
+  } else {
+    log("COUNTY_FIELD_NOT_PRESENT", "County field was not visible on this renewal page; continuing");
+  }
 
   log("Entering lease break fee", data.earlyTerminationRate);
   await fillByLabel(page, ["Lease Break Fee Amount", "2x Rent", "Lease Break Fee"], data.earlyTerminationRate);
@@ -2432,6 +2442,23 @@ async function clearCustomDropdown(page, control) {
     }
     if (!clicked) return;
     await page.waitForTimeout(250);
+  }
+}
+
+async function closeOpenSelectDropdowns(page, context) {
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    const openDropdownCount = await page.locator(".Select-menu-outer:visible, .Select-menu:visible, [role='listbox']:visible").count().catch(() => 0);
+    if (openDropdownCount === 0) return;
+
+    log("DROPDOWN_CLOSE", `${context} attempt=${attempt} open=${openDropdownCount}`);
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.evaluate(() => document.activeElement?.blur?.()).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+
+  const remainingDropdownCount = await page.locator(".Select-menu-outer:visible, .Select-menu:visible, [role='listbox']:visible").count().catch(() => 0);
+  if (remainingDropdownCount > 0) {
+    log("DROPDOWN_CLOSE_WARNING", `${context} remaining=${remainingDropdownCount}`);
   }
 }
 
