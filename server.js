@@ -698,7 +698,7 @@ const server = http.createServer(async (request, response) => {
   const { pathname } = new URL(request.url, `http://${request.headers.host}`);
 
   try {
-    if ((pathname === "/run-renewal" || pathname.startsWith("/api/")) && (await handleApi(request, response, pathname))) {
+    if ((pathname === "/run-renewal" || pathname === "/run-renewal/status" || pathname.startsWith("/api/")) && (await handleApi(request, response, pathname))) {
       return;
     }
   } catch (error) {
